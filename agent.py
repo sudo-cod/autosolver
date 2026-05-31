@@ -36,6 +36,7 @@ import calibrate
 API_URL = "https://api.longcat.chat/anthropic/v1/messages"
 STATE_FILE = os.path.join(os.path.dirname(__file__), "agent_state.json")
 DAILY_LIMIT = 20  # judge allows 20 submissions/day per team
+BASELINE_SCORE = 1710.58  # verified reference-solver avg_score (the bar to beat)
 
 
 def _today():
@@ -88,8 +89,9 @@ verbatim against the input candidate rows, and any mismatch is counted INVALID.
 
 OBJECTIVE (lexicographic):
   1. MAXIMIZE the number of distinct orders (tasks) that get covered.
-  2. Among solutions with equal coverage, MINIMIZE the total_score summed
-     over chosen assignments.
+  2. Among solutions with equal coverage, MINIMIZE the judge's cost function.
+  The judge's per-assignment cost is NOT raw total_score; the calibrated cost
+  model (provided separately below, when available) is your true objective.
 
 CONSTRAINTS:
   - Each courier may appear in at most ONE chosen assignment.
@@ -117,16 +119,31 @@ You are an expert in combinatorial optimization and competitive programming.
 You write correct, fast, self-contained Python solvers. You think carefully
 about the objective and constraints, exploit problem structure (this is a
 weighted bipartite matching / set-packing problem), and you ALWAYS return a
-valid solution within the time limit. When given feedback (a score and notes
-on a previous attempt), you diagnose WHY the score is what it is and make a
-concrete, targeted change to improve it. Output only runnable Python code."""
+valid solution within the time limit. The judge's true cost function is given
+by the calibrated cost model in the prompt — optimize for THAT, not for raw
+total_score.
+
+When given feedback (a score and notes on a previous attempt), you diagnose
+WHY the score is what it is and make a concrete, targeted change to improve it.
+Output only runnable Python code."""
+
+COACH_SYSTEM_PROMPT = """\
+You are a strategy coach for an autonomous optimization agent that writes
+Python solvers for a courier task-assignment problem (weighted set-packing /
+bipartite matching). You do NOT write code. Given the latest results, the
+calibrated cost objective, and the trajectory, output ONE concise, concrete
+directive telling the solver what to change next: what to fix, what algorithm
+to try, or what to STOP doing. Reason about the calibrated cost (not raw
+total_score) and the per-case weak spots. Be specific and actionable. If the
+solver is stuck repeating an approach, push it toward a genuinely different
+algorithm family. Respond with at most 8 lines of plain text — no code."""
 
 
-def call_claude(model, messages, api_key, max_tokens=8000):
+def call_claude(model, messages, api_key, max_tokens=8000, system=SYSTEM_PROMPT):
     body = json.dumps({
         "model": model,
         "max_tokens": max_tokens,
-        "system": SYSTEM_PROMPT,
+        "system": system,
         "messages": messages,
     }).encode()
     req = urllib.request.Request(API_URL, data=body, method="POST")
@@ -185,9 +202,10 @@ def code_hash(code: str) -> str:
     return hashlib.sha1(code.encode()).hexdigest()[:10]
 
 
-def build_reflection(history, last_code, last_result: ScoreResult,
-                     submitted: bool, gate_info: dict):
-    """Construct the feedback message that drives the next rewrite.
+def build_facts(history, last_result: ScoreResult,
+                submitted: bool, gate_info: dict):
+    """Render the DETERMINISTIC facts (local-gate results, judge per-case
+    results, trajectory) the solver/coach reason over. Exact and free — no LLM.
 
     `submitted` is True if this candidate was actually sent to the real judge
     (so last_result holds per-case feedback); False if it was only evaluated by
@@ -196,7 +214,37 @@ def build_reflection(history, last_code, last_result: ScoreResult,
 
     # --- Local gate outcome (always available) -----------------------------
     if gate_info is not None:
-        if gate_info.get("error"):
+        # Multi-case breakdown
+        cases = gate_info.get("cases", {})
+        if cases:
+            n_passed = sum(1 for c in cases.values() if c.get("ok"))
+            n_total = len(cases)
+            lines.append(f"LOCAL GATE: {n_passed}/{n_total} test cases passed.")
+            for cname, cr in cases.items():
+                st = cr.get("stats", {})
+                elapsed = cr.get("elapsed", 0)
+                if cr.get("error"):
+                    lines.append(f"  [CRASH] {cname}: {cr['error'][:120]}  "
+                                 f"(FIX THIS — solver must not crash/timeout)")
+                elif cr.get("errors"):
+                    errs = cr["errors"]
+                    lines.append(f"  [INVALID] {cname}: covered={st.get('covered',0)}/{st.get('total_tasks',0)}  "
+                                 f"errors: {'; '.join(errs[:3])}")
+                else:
+                    lines.append(f"  [OK] {cname}: covered={st.get('covered',0)}/{st.get('total_tasks',0)}  "
+                                 f"score={st.get('total_score',0):.2f}  {elapsed:.1f}s")
+            # Highlight the weakest case
+            worst = None
+            for cname, cr in cases.items():
+                st = cr.get("stats", {})
+                if st:
+                    cov_pct = st.get("covered", 0) / max(st.get("total_tasks", 1), 1)
+                    if worst is None or cov_pct < worst[1]:
+                        worst = (cname, cov_pct, st)
+            if worst and worst[1] < 1.0:
+                lines.append(f"\n  WEAKEST CASE: {worst[0]} — only {worst[2].get('covered',0)}/{worst[2].get('total_tasks',0)} "
+                             f"tasks covered ({worst[1]*100:.0f}%). Focus improvement here.")
+        elif gate_info.get("error"):
             lines.append("LOCAL GATE: your solver crashed or timed out BEFORE "
                          "any submission was spent.")
             lines.append(f"Runtime error: {gate_info['error']}")
@@ -228,6 +276,8 @@ def build_reflection(history, last_code, last_result: ScoreResult,
             lines.append(f"\nREAL JUDGE rejected the submission: {last_result.message}")
         if last_result.case_results:
             lines.append("Per-case judge results:")
+            failed_cases = []
+            ok_cases = []
             for c in last_result.case_results:
                 name = c.get("case_file", "?")
                 status = c.get("status", "?")
@@ -241,27 +291,120 @@ def build_reflection(history, last_code, last_result: ScoreResult,
                     e0 = f"  err: {errs[0]}" if errs else ""
                     lines.append(f"  [{tag}] {name}: penalty={pen} "
                                  f"assigned={c.get('assigned')}/{c.get('total_tasks')}{e0}")
+                    failed_cases.append((name, tag, pen, c.get('assigned'), c.get('total_tasks'), errs[:2]))
                 else:
                     lines.append(f"  [ok] {name}: score={c.get('score')} "
                                  f"assigned={c.get('assigned')}/{c.get('total_tasks')}")
+                    ok_cases.append(name)
+
+            # Actionable diagnosis for failed cases
+            if failed_cases:
+                lines.append("\nFAILURE ANALYSIS:")
+                for name, tag, pen, assigned, total, errs in failed_cases[:5]:
+                    if tag == "ERROR" and assigned is None:
+                        lines.append(f"  - {name}: SOLVER CRASHED/TIMED OUT. "
+                                     f"The solve() function did not return in time or raised an exception. "
+                                     f"Simplify your algorithm or add a timeout guard.")
+                    elif tag == "INVALID":
+                        lines.append(f"  - {name}: INVALID OUTPUT. "
+                                     f"The solution format was wrong. "
+                                     f"Ensure task_id_list_str matches input rows VERBATIM.")
+                    elif assigned is not None and total is not None and assigned < total:
+                        uncovered = total - assigned
+                        lines.append(f"  - {name}: only {assigned}/{total} assigned, "
+                                     f"{uncovered} tasks uncovered (penalty={pen}). "
+                                     f"Improve coverage on this case type.")
     else:
         lines.append("\n(This candidate was NOT submitted to the real judge — "
                      "we only spend one of the limited daily submissions on a "
                      "solver that is locally valid and improved.)")
 
-    # --- Trajectory --------------------------------------------------------
+    # --- Trajectory with scores ---------------------------------------------
     if history:
         lines.append("\nHistory (iter: local-valid? / real-score-if-submitted):")
-        for h in history[-8:]:
+        for h in history[-10:]:
             tag = "valid" if h.get("gate_ok") else "INVALID"
-            sub = f" submitted->{h['score']:.2f}" if h.get("submitted") and h.get("ok") else ""
-            lines.append(f"  iter {h['iter']}: {tag}{sub}  ({h['note'][:60]})")
+            score_str = ""
+            if h.get("submitted") and h.get("ok") and h.get("score") is not None:
+                score_str = f" real_score={h['score']:.2f}"
+            pred = h.get("predicted_score")
+            pred_str = f" predicted={pred:.1f}" if pred is not None else ""
+            lines.append(f"  iter {h['iter']}: {tag}{score_str}{pred_str}  ({h['note'][:60]})")
 
-    lines.append("\nDiagnose the single biggest problem above, then make ONE "
-                 "concrete change. Keep solve() correct and under 10s per case. "
-                 "Output ONLY the full revised Python module, starting with imports.")
-    lines.append("\nHere is your previous code:\n\n" + last_code)
     return "\n".join(lines)
+
+
+def _default_directive(submitted, last_result, gate_info):
+    """Cheap deterministic directive for ordinary (non-event) iterations."""
+    if submitted and last_result.ok and last_result.score is not None:
+        return (f"Real score {last_result.score:.2f}. Make ONE targeted change to "
+                "the worst per-case result above. Output the full module.")
+    return ("Make ONE concrete improvement to the worst-predicted case. "
+            "Output ONLY the full revised Python module, starting with imports.")
+
+
+def coach_directive(facts_text, formula_str, baseline, best_real, api_key, model):
+    """Ask the LLM coach for the next strategic directive. Falls back to a
+    deterministic line if the coach call fails, so it never blocks the solver."""
+    user = (f"Calibrated per-assignment cost objective: {formula_str}\n"
+            f"  where ts = the row's total_score, w = the row's willingness "
+            f"(accept probability, 0..1). Per-case score = sum of chosen "
+            f"assignments' cost + penalty for each UNASSIGNED task. Lower=better.\n"
+            f"Reference baseline avg_score: {baseline} | best so far: {best_real}\n\n"
+            f"Latest results and trajectory:\n{facts_text}\n\n"
+            "Give the solver ONE concrete directive for its next attempt.")
+    messages = [{"role": "user", "content": user}]
+    for attempt in range(3):
+        try:
+            out = call_claude(model, messages, api_key,
+                              max_tokens=400, system=COACH_SYSTEM_PROMPT)
+            out = out.strip()
+            if out:
+                return "COACH DIRECTIVE:\n" + out
+        except Exception as e:
+            print(f"  coach call failed (attempt {attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+    return None
+
+
+def _cost_formula_str(cm):
+    """Render the calibrated per-assignment cost formula as readable text."""
+    if cm is None:
+        return "uncalibrated"
+    if cm.form == "expected_value":
+        P = cm.params.get("P", cm.penalty_per_task)
+        return (f"cost = willingness*total_score + "
+                f"(1 - willingness)*{P:.1f}*num_tasks")
+    if cm.form.startswith("exact:"):
+        return f"cost = {cm.form.split(':', 1)[1]}"
+    terms = " ".join(f"{coef:+.3f}*{t}" for t, coef in cm.params.items())
+    return f"cost = {terms}"
+
+
+def _build_formula_desc(cm):
+    """Return a human-readable description of the calibrated cost formula
+    suitable for injection into the LLM's problem brief."""
+    if cm is None or not cm.calibrated:
+        return ""
+    desc = _cost_formula_str(cm)
+    if cm.form == "expected_value":
+        desc += ("\n  Intuition: an assignment delivered with probability "
+                 "`willingness` costs its total_score; if it FAILS, each of its "
+                 "tasks costs 100. So PREFER high-willingness, low-total_score "
+                 "assignments. Leaving a task unassigned also costs 100.")
+    desc += f"\n  (max_residual={cm.max_resid:.4g}, "
+    desc += f"unassigned penalty {cm.penalty_per_task:.1f}/task, "
+    desc += f"calibrated on {cm.n_points} points.)"
+    return ("\n\n[CALIBRATED COST MODEL — minimize this; it is your true objective]\n"
+            + desc)
+
+
+def _format_formula(cm):
+    """Short one-line formula string for inline system messages."""
+    if cm is None:
+        return "uncalibrated"
+    return f"{_cost_formula_str(cm)}, penalty={cm.penalty_per_task:.1f}/task"
 
 
 def _local_score(stats):
@@ -291,6 +434,9 @@ def run_agent(model, iterations, api_key, case_name):
 
     history = []  # this run's iterations (run_log.jsonl holds the full cross-run history)
 
+    # Build calibrated formula description for the LLM
+    formula_desc = _build_formula_desc(_cm)
+
     # Seed the opening prompt from accumulated knowledge so each run BUILDS ON
     # past attempts instead of restarting from scratch.
     past = archive.load_history()
@@ -298,7 +444,7 @@ def run_agent(model, iterations, api_key, case_name):
     seed = archive.best_real_solver(past)
     if digest:
         print(f"Loaded knowledge from {len(past)} past attempts.")
-    opening = PROBLEM_BRIEF + digest
+    opening = PROBLEM_BRIEF + formula_desc + digest
     if seed and seed[2]:
         _, seed_score, seed_code = seed
         opening += (f"\n\nHere is the BEST solver so far (real avg_score="
@@ -315,30 +461,54 @@ def run_agent(model, iterations, api_key, case_name):
     for it in range(iterations):
         print(f"\n{'='*60}\nITERATION {it}\n{'='*60}")
 
-        # 1) GENERATE / REWRITE code
-        try:
-            raw = call_claude(model, messages, api_key)
-        except Exception as e:
-            print(f"  API call failed: {e}")
-            break
+        # 1) GENERATE / REWRITE code (retry up to 3 times on transient errors)
+        raw = None
+        for _retry in range(3):
+            try:
+                raw = call_claude(model, messages, api_key)
+                break
+            except Exception as e:
+                print(f"  API call failed (attempt {_retry+1}/3): {e}")
+                if _retry < 2:
+                    wait = 5 * (_retry + 1)
+                    print(f"  retrying in {wait}s...")
+                    time.sleep(wait)
+        if raw is None:
+            print("  API call failed after 3 attempts — skipping this iteration.")
+            continue
         code = strip_fences(raw)
         h = code_hash(code)
         algo = archive.parse_algorithm(raw)
         archive.archive_solver(h, code)
         print(f"  generated solver  [hash {h}]  ({len(code)} chars)  algo: {algo}")
 
-        # 2) LOCAL GATE — run + validate WITHOUT spending a submission
+        # 2) LOCAL GATE — run + validate on ALL local cases WITHOUT spending a submission
         gate_ok, gate_info = run_local_gate(code)
         if gate_ok:
             local_score = _local_score(gate_info["stats"])
             st = gate_info["stats"]
-            print(f"  LOCAL VALID  covered={st['covered']}/{st['total_tasks']} "
+            n_cases = gate_info.get("n_cases", 1)
+            print(f"  LOCAL VALID across {n_cases} case(s)  "
+                  f"covered={st['covered']}/{st['total_tasks']} "
                   f"total_score={st['total_score']:.2f} "
-                  f"local_est={local_score:.1f} ({gate_info['elapsed']:.1f}s)")
+                  f"predicted_score={local_score:.1f} ({gate_info['elapsed']:.1f}s)")
+            # Print per-case breakdown
+            for cname, cinfo in gate_info.get("cases", {}).items():
+                cs = cinfo.get("stats", {})
+                cpred = cs.get("predicted_score", 0.0)
+                print(f"    {cname}: covered={cs.get('covered')}/{cs.get('total_tasks')} "
+                      f"predicted={cpred:.1f} ({cinfo.get('elapsed', 0):.1f}s)")
         else:
             local_score = float("inf")
-            reason = gate_info.get("error") or "; ".join(gate_info.get("errors", [])[:3])
-            print(f"  LOCAL INVALID — not submittable. {reason[:120]}")
+            # Summarize which cases failed and why
+            fail_summary = []
+            for cname, cinfo in gate_info.get("cases", {}).items():
+                if cinfo.get("error"):
+                    fail_summary.append(f"{cname}: CRASH")
+                elif cinfo.get("errors"):
+                    fail_summary.append(f"{cname}: INVALID")
+            reason = gate_info.get("error") or "; ".join(fail_summary[:5])
+            print(f"  LOCAL INVALID — not submittable. {reason[:200]}")
 
         # 3) DECIDE: spend a real submission?
         submitted = False
@@ -346,7 +516,13 @@ def run_agent(model, iterations, api_key, case_name):
         if is_http and gate_ok:
             first_ever = state["best_real_score"] is None
             improved = local_score < last_submitted_local
-            if state["daily_remaining"] <= 0:
+            # Sanity check: if predicted_score is negative or absurd, the local
+            # model is unreliable for this solver — don't waste a submission.
+            sane = local_score > -1000  # real scores are ~200-3000
+            if not sane:
+                print(f"  LOCAL SCORE ABSURD ({local_score:.1f}) — skipping submission "
+                      f"(calibrated model unreliable for this solver).")
+            elif state["daily_remaining"] <= 0:
                 print("  BUDGET EXHAUSTED — iterating locally only (no submission).")
             elif first_ever or improved:
                 print(f"  SUBMITTING to real judge "
@@ -393,15 +569,20 @@ def run_agent(model, iterations, api_key, case_name):
                       f"(best_solver.py kept = real-scored solver)")
 
         # 5) LOG
+        predicted_score = gate_info.get("stats", {}).get("predicted_score") if gate_ok else None
         history.append({"iter": it, "hash": h, "gate_ok": gate_ok,
                         "submitted": submitted, "ok": result.ok,
                         "score": result.score if result.ok else float("inf"),
+                        "predicted_score": predicted_score,
+                        "algo": algo,
                         "note": result.message})
         with open("run_log.jsonl", "a") as f:
             f.write(json.dumps({
                 "iter": it, "hash": h, "algorithm": algo, "gate_ok": gate_ok,
+                "gate_cases": gate_info.get("cases"),
                 "gate_errors": gate_info.get("errors"),
                 "gate_runtime_error": gate_info.get("error"),
+                "predicted_score": predicted_score,
                 "submitted": submitted,
                 "ok": result.ok,
                 "score": result.score if result.ok else None,
@@ -412,14 +593,48 @@ def run_agent(model, iterations, api_key, case_name):
                 "ts": time.time(),
             }) + "\n")
 
-        # 5b) AUTO-RECALIBRATE — if we just captured fresh per-assignment detail,
-        # refit cost()+penalty and re-check predicted-vs-actual (no submission).
+        # 5b) AUTO-RECALIBRATE — refit cost()+penalty using only the latest
+        # submission's detail. This keeps the formula current with the best
+        # solver's behavior and ignores outliers from old bad solvers.
         if submitted and result.ok and result.case_results:
-            calibrate.recalibrate()
+            report = calibrate.recalibrate(only_best=True)
+            if report:
+                _cm = calibrate.load_model()
+                if _cm and _cm.calibrated:
+                    formula_str = _format_formula(_cm)
+                    print(f"  [calibrate] Updated formula: {formula_str}")
+                    print(f"  [calibrate] max_resid={report['cost_max_err']:.3f} "
+                          f"case_max_err={report['case_max_err']:.4f} "
+                          f"points={report['n_points']}")
+                    # Inject updated formula into the conversation so the LLM
+                    # sees the latest cost model for the next generation
+                    formula_msg = (
+                        f"\n[SYSTEM: Cost formula updated after last submission. "
+                        f"Current calibrated model: {formula_str}. "
+                        f"Use this as your optimization objective. "
+                        f"Lower predicted cost → better real score.]")
+                    messages[-1]["content"] = messages[-1]["content"] + formula_msg
 
         # 6) REFLECT -> next message (skip on last iteration)
         if it < iterations - 1:
-            feedback = build_reflection(history, code, result, submitted, gate_info)
+            facts = build_facts(history, result, submitted, gate_info)
+            # If the solver just produced byte-identical code to the previous
+            # iteration, it's stuck in a deterministic loop — flag it loudly so
+            # the coach pushes for a genuinely different approach.
+            if len(history) >= 2 and history[-1]["hash"] == history[-2]["hash"]:
+                facts += ("\n\nWARNING: this solver is BYTE-IDENTICAL to the "
+                          "previous iteration — you are repeating yourself. The "
+                          "next attempt MUST be a fundamentally different algorithm.")
+            # The coach analyzes EVERY iteration and writes the next directive.
+            print("  COACH: analyzing results for next directive...")
+            directive = coach_directive(
+                facts, _format_formula(calibrate.load_model()),
+                BASELINE_SCORE, state.get("best_real_score"),
+                api_key, model)
+            if directive is None:           # coach failed -> deterministic fallback
+                directive = _default_directive(submitted, result, gate_info)
+            feedback = (facts + "\n\n" + directive
+                        + "\n\nHere is your previous code:\n\n" + code)
             messages.append({"role": "assistant", "content": code})
             messages.append({"role": "user", "content": feedback})
             if len(messages) > 7:
@@ -434,6 +649,18 @@ def run_agent(model, iterations, api_key, case_name):
 
 def gate_info_msg(gate_info):
     st = gate_info.get("stats", {})
+    cases = gate_info.get("cases", {})
+    if cases:
+        parts = []
+        for name, c in cases.items():
+            cs = c.get("stats", {})
+            if c.get("error"):
+                parts.append(f"{name}: ERROR")
+            elif c.get("errors"):
+                parts.append(f"{name}: INVALID")
+            else:
+                parts.append(f"{name}: {cs.get('covered', '?')}/{cs.get('total_tasks', '?')}")
+        return "VALID [" + "; ".join(parts) + "]"
     return (f"VALID covered={st.get('covered')}/{st.get('total_tasks')} "
             f"total_score={st.get('total_score', 0):.2f} (local estimate)")
 
@@ -475,7 +702,7 @@ def bootstrap_calibration(case_name):
             "ts": time.time(),
         }) + "\n")
     print(f"Probe scored avg={result.score:.4f}. Fitting cost model...")
-    calibrate.recalibrate()
+    calibrate.recalibrate(only_best=True)
 
 
 def main():
@@ -504,6 +731,22 @@ def main():
     api_key = os.environ.get("LONGCAT_KEY")
     if not api_key:
         print("ERROR: LONGCAT_KEY not found in environment or .env"); sys.exit(1)
+
+    # Fix 4: Auto-calibrate before the agent loop when in http mode.
+    # This ensures the local score predicts the real judge score, so the
+    # "is this better?" decision is meaningful.
+    is_http = os.environ.get("JUDGE_MODE", "local") == "http"
+    if is_http:
+        _cm = calibrate.load_model()
+        if not (_cm and _cm.calibrated):
+            print("No calibrated cost model found — running calibration probe "
+                  "(costs 1 submission)...")
+            bootstrap_calibration(args.case)
+        else:
+            # Re-fit from best submission only — avoids distortion from old bad solvers
+            print(f"Refreshing calibrated model (current: {_cm.form}, "
+                  f"penalty={_cm.penalty_per_task:.3f})...")
+            calibrate.recalibrate(only_best=True)
 
     print(f"AutoSolver Agent | model={args.model} | "
           f"judge_mode={os.environ.get('JUDGE_MODE','local')} | "

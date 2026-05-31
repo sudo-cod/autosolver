@@ -39,6 +39,7 @@ import urllib.error
 #   "browser" : judge is a web form; we drive a headless browser (Playwright)
 #   "manual"  : no automation possible; agent pauses and you paste the score
 #   "local"   : no judge call at all; score locally from the data (offline dev)
+HERE = os.path.dirname(__file__)
 JUDGE_MODE = os.environ.get("JUDGE_MODE", "local")
 
 
@@ -375,7 +376,7 @@ def validate_solution(solution, input_text):
             covered.update(tasks)
             total_score += sc
             if cost_model is not None:
-                predicted_cost += cost_model.predict_cost(sc, willingness)
+                predicted_cost += cost_model.predict_cost(sc, willingness, len(tasks))
 
     stats = {
         "covered": len(covered),
@@ -391,63 +392,185 @@ def validate_solution(solution, input_text):
 
 
 def _submit_local(solver_code: str, case_name: str) -> ScoreResult:
-    _default = os.path.join(os.path.dirname(__file__), "large_seed301.txt")
-    case_path = os.environ.get("LOCAL_CASE", _default)
-    try:
-        with open(case_path) as f:
-            input_text = f.read()
-    except Exception as e:
-        return ScoreResult(ok=False, message=f"cannot read case: {e}")
-
-    sol, err = _run_solver_locally(solver_code, input_text)
-    if sol is None:
-        return ScoreResult(ok=False, message=f"solver failed: {err}")
-
-    ok, errors, stats = validate_solution(sol, input_text)
+    ok, info = run_local_gate(solver_code)
     if not ok:
-        shown = "; ".join(errors[:5])
-        more = f" (+{len(errors)-5} more)" if len(errors) > 5 else ""
-        return ScoreResult(ok=False, score=float("inf"),
-                           message=f"INVALID solution: {shown}{more}",
-                           raw={"errors": errors, "stats": stats})
+        # Find the first error to report
+        for cname, cr in info.get("cases", {}).items():
+            if cr.get("error"):
+                return ScoreResult(ok=False, score=float("inf"),
+                                   message=f"[{cname}] solver failed: {cr['error']}")
+            if cr.get("errors"):
+                shown = "; ".join(cr["errors"][:5])
+                return ScoreResult(ok=False, score=float("inf"),
+                                   message=f"[{cname}] INVALID: {shown}")
+        return ScoreResult(ok=False, message="local gate failed (unknown reason)")
 
-    # Best-known penalty estimate (calibrate to real judge later).
-    # Lower is better: reward coverage, then minimize assignment score.
-    covered = stats["covered"]
-    total = stats["total_tasks"]
-    combined = -1e6 * covered + stats["total_score"]
-    return ScoreResult(ok=True, score=combined, accepted_orders=covered,
-                       raw={"stats": stats},
-                       message=f"VALID covered={covered}/{total} "
-                               f"total_score={stats['total_score']:.2f} "
-                               f"(local estimate, not real judge score)")
+    st = info["stats"]
+    n_cases = st.get("n_cases", 1)
+    n_passed = st.get("n_cases_passed", 0)
+
+    if "predicted_score" in st:
+        avg_score = st["predicted_score"]
+    else:
+        covered = st.get("covered", 0)
+        total = st.get("total_tasks", 0)
+        avg_score = (-1e6 * covered + st.get("total_score", 0)) / max(n_cases, 1)
+
+    return ScoreResult(
+        ok=True, score=avg_score,
+        accepted_orders=st.get("covered", 0),
+        raw={"stats": st, "cases": info.get("cases", {})},
+        message=f"VALID {n_passed}/{n_cases} cases passed, "
+                f"covered={st.get('covered')}/{st.get('total_tasks')} "
+                f"avg_score={avg_score:.2f} (local estimate)")
 
 
 # ===========================================================================
 # Local gate — run + validate a solver WITHOUT spending a real submission.
 # The orchestrator calls this before deciding whether to submit.
 # ===========================================================================
+def _local_case_files():
+    """Return a dict of {case_name: file_path} for every available local
+    test case. Scans the project root and common subdirectories (dataset/, data/)
+    for .txt files, excluding example_solution.txt."""
+    cases = {}
+    exclude = {"example_solution.txt", "README.md"}
+    search_dirs = [HERE]
+    for subdir in ("dataset", "data"):
+        subpath = os.path.join(HERE, subdir)
+        if os.path.isdir(subpath):
+            search_dirs.append(subpath)
+    for sdir in search_dirs:
+        for fname in os.listdir(sdir):
+            if fname.endswith(".txt") and fname not in exclude:
+                cases[fname[:-4]] = os.path.join(sdir, fname)
+    return cases
+
+
 def run_local_gate(solver_code: str, case_path: Optional[str] = None):
-    """Execute the solver locally on a case file and validate its output.
-    Returns (ok: bool, info: dict). info has: error (runtime), errors (validity
-    list), stats, and elapsed. ok=True only if it ran AND validated clean."""
-    if case_path is None:
-        case_path = os.environ.get(
-            "LOCAL_CASE", os.path.join(os.path.dirname(__file__), "large_seed301.txt"))
-    try:
-        with open(case_path) as f:
-            input_text = f.read()
-    except Exception as e:
-        return False, {"error": f"cannot read case {case_path}: {e}"}
+    """Execute the solver locally on one or more case files and validate output.
 
-    t0 = time.time()
-    sol, err = _run_solver_locally(solver_code, input_text)
-    elapsed = time.time() - t0
-    if sol is None:
-        return False, {"error": err, "elapsed": elapsed}
+    When case_path is given (or LOCAL_CASE is set), tests ONLY that case.
+    When neither is set, tests ALL locally available .txt cases.
 
-    ok, errors, stats = validate_solution(sol, input_text)
-    return ok, {"errors": errors, "stats": stats, "elapsed": elapsed}
+    Returns (ok: bool, info: dict).
+      ok   = True only if ALL cases ran and validated cleanly.
+      info = {elapsed, cases: {case_name: {ok, error, errors, stats, predicted_score}}, ...}
+    """
+    # Determine which cases to test
+    if case_path is not None:
+        cases = {"user_specified": case_path}
+    else:
+        env_case = os.environ.get("LOCAL_CASE")
+        if env_case:
+            cases = {"user_specified": env_case}
+        else:
+            cases = _local_case_files()
+            if not cases:
+                # fallback to the default single case
+                default = os.path.join(HERE, "dataset/large_seed301.txt")
+                cases = {"large_seed301": default}
+
+    total_elapsed = 0.0
+    all_case_results = {}
+    any_failure = False
+
+    # --- Phase 1: run solver + validate on each case (single execution per case) ---
+    for case_name, cpath in cases.items():
+        try:
+            with open(cpath) as f:
+                input_text = f.read()
+        except Exception as e:
+            all_case_results[case_name] = {"ok": False, "error": f"cannot read {cpath}: {e}"}
+            any_failure = True
+            continue
+
+        t0 = time.time()
+        sol, err = _run_solver_locally(solver_code, input_text)
+        elapsed = time.time() - t0
+        total_elapsed += elapsed
+
+        if sol is None:
+            all_case_results[case_name] = {"ok": False, "error": err, "elapsed": elapsed}
+            any_failure = True
+            continue
+
+        ok, errors, stats = validate_solution(sol, input_text)
+        all_case_results[case_name] = {
+            "ok": ok, "errors": errors, "stats": stats, "elapsed": elapsed,
+            "_sol": sol, "_input": input_text,   # cached for phase 2
+        }
+        if not ok:
+            any_failure = True
+
+    # --- Phase 2: compute predicted score reusing the already-run solutions ---
+    cost_model = _get_cost_model()
+    per_case_predicted = {}   # case_name -> predicted cost (or None)
+    if cost_model is not None:
+        for case_name, r in all_case_results.items():
+            if r.get("error") or not r.get("stats"):
+                per_case_predicted[case_name] = None
+                continue
+            if not r.get("ok"):
+                # invalid solution: penalty = all tasks unassigned
+                per_case_predicted[case_name] = r["stats"].get("total_tasks", 0) * 100
+                continue
+            try:
+                sol = r["_sol"]
+                input_text = r["_input"]
+                cmap, all_t = _parse_candidates(input_text)
+                covered = set()
+                case_cost = 0.0
+                for ts, couriers in sol:
+                    for c in couriers:
+                        row = cmap.get((ts, str(c)))
+                        if row:
+                            _, sc, w = row
+                            case_cost += cost_model.predict_cost(sc, w)
+                            covered.update(row[0])
+                uncovered = len(all_t) - len(covered)
+                per_case_predicted[case_name] = (
+                    case_cost + cost_model.penalty_per_task * uncovered
+                )
+            except Exception:
+                per_case_predicted[case_name] = r["stats"].get("total_tasks", 0) * 100
+
+    # Attach per-case predicted_score into the case result dict
+    valid_predicted = [v for v in per_case_predicted.values() if v is not None]
+    avg_predicted = (sum(valid_predicted) / len(valid_predicted)) if valid_predicted else None
+    for case_name, pred in per_case_predicted.items():
+        if case_name in all_case_results:
+            all_case_results[case_name]["predicted_score"] = pred
+            # remove cached internals so they don't leak into logs
+            all_case_results[case_name].pop("_sol", None)
+            all_case_results[case_name].pop("_input", None)
+
+    # Aggregate stats across all cases for backward compat
+    total_covered = sum(
+        r["stats"]["covered"] for r in all_case_results.values()
+        if r.get("stats"))
+    total_tasks = sum(
+        r["stats"]["total_tasks"] for r in all_case_results.values()
+        if r.get("stats"))
+    total_score = sum(
+        r["stats"]["total_score"] for r in all_case_results.values()
+        if r.get("stats"))
+
+    agg_stats = {
+        "covered": total_covered,
+        "total_tasks": total_tasks,
+        "total_score": total_score,
+        "n_cases": len(cases),
+        "n_cases_passed": sum(1 for r in all_case_results.values() if r.get("ok")),
+    }
+    if avg_predicted is not None:
+        agg_stats["predicted_score"] = avg_predicted
+
+    return (not any_failure), {
+        "cases": all_case_results,
+        "stats": agg_stats,
+        "elapsed": total_elapsed,
+    }
 
 
 # ===========================================================================

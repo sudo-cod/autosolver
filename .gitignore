@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+agent_state.json
+run_log.jsonl
+cost_model.json
+solver_archive/
+.venv/
+.idea/

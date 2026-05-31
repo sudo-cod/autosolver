@@ -33,36 +33,61 @@ CASE_TOL = 1e-2       # per-case predicted-vs-actual tolerance
 # ---------------------------------------------------------------------------
 def _local_input_map():
     """case_file basename (without .txt) -> parsed candidate map, for every
-    case whose input file exists locally."""
+    case whose input file exists locally. Scans project root + dataset/ + data/."""
     out = {}
-    for fname in os.listdir(HERE):
-        if fname.endswith(".txt") and fname not in ("example_solution.txt",):
-            path = os.path.join(HERE, fname)
-            try:
-                with open(path) as f:
-                    cmap, _ = judge_adapter._parse_candidates(f.read())
-                if cmap:
-                    out[fname] = cmap          # keyed by exact filename, e.g. large_seed301.txt
-                    out[fname[:-4]] = cmap      # and without .txt
-            except Exception:
-                continue
+    exclude = {"example_solution.txt", "README.md"}
+    search_dirs = [HERE]
+    for subdir in ("dataset", "data"):
+        subpath = os.path.join(HERE, subdir)
+        if os.path.isdir(subpath):
+            search_dirs.append(subpath)
+    for sdir in search_dirs:
+        for fname in os.listdir(sdir):
+            if fname.endswith(".txt") and fname not in exclude:
+                path = os.path.join(sdir, fname)
+                try:
+                    with open(path) as f:
+                        cmap, _ = judge_adapter._parse_candidates(f.read())
+                    if cmap:
+                        out[fname] = cmap          # keyed by exact filename, e.g. large_seed301.txt
+                        out[fname[:-4]] = cmap      # and without .txt
+                except Exception:
+                    continue
     return out
 
 
 # ---------------------------------------------------------------------------
 # Build the calibration dataset from logged submissions carrying detail.
 # ---------------------------------------------------------------------------
-def build_dataset(records=None):
+def build_dataset(records=None, only_best=False, max_cost=float("inf")):
+    """Mine cost points and aggregates from logged submissions.
+
+    only_best: if True, only use the lowest-scoring (best) submission.
+    max_cost: optional upper bound to drop cost points (default: off). The
+              exact formula cost = w*ts + (1-w)*100*num_tasks fits ALL points,
+              including failed 2-task bundles near cost≈200, so no filtering is
+              needed; the bound is kept only as an escape hatch.
+    """
     if records is None:
         records = archive.load_history()
     inputs = _local_input_map()
 
-    points = []       # (total_score, willingness, cost)
+    # Filter to submitted+ok records
+    ok_records = [r for r in records
+                  if r.get("submitted") and r.get("ok") and r.get("score") is not None]
+    if not ok_records:
+        # Fall back to all submitted records (may have None scores from errors)
+        ok_records = [r for r in records if r.get("submitted") and r.get("ok")]
+
+    if only_best:
+        ok_records.sort(key=lambda r: r.get("score", float("inf")))
+        if ok_records:
+            ok_records = [ok_records[0]]
+
+    points = []       # (total_score, willingness, num_tasks, cost)
     aggregates = []   # dicts per (record, case) with detail
 
-    for r in records:
-        if not (r.get("submitted") and r.get("ok")):
-            continue
+    for r in ok_records:
         for c in (r.get("case_results") or []):
             detail = c.get("detail")
             if not detail:
@@ -73,6 +98,10 @@ def build_dataset(records=None):
             total = c.get("total_tasks")
             sum_cost = 0.0
             cmap = inputs.get(name) or inputs.get(name[:-4] if name.endswith(".txt") else name)
+            # Per-assignment input features for this case, when we have its input
+            # file — lets validate() recompute the case score FROM THE MODEL
+            # (a genuine test) rather than from the judge's own costs.
+            model_feats = [] if cmap is not None else None
             for d in detail:
                 cost = d.get("cost")
                 if cost is None:
@@ -85,14 +114,17 @@ def build_dataset(records=None):
                         continue
                     row = cmap.get((ts, str(couriers[0])))
                     if row is not None:
-                        _, total_score, willingness = row
-                        points.append((total_score, willingness, cost))
+                        tasks, total_score, willingness = row
+                        model_feats.append((total_score, willingness, len(tasks)))
+                        if cost <= max_cost:
+                            points.append((total_score, willingness, len(tasks), cost))
             unassigned = None
             if assigned is not None and total is not None:
                 unassigned = total - assigned
             aggregates.append({
                 "case": name, "reported": reported, "sum_cost": sum_cost,
                 "assigned": assigned, "total": total, "unassigned": unassigned,
+                "model_feats": model_feats,
             })
     return points, aggregates
 
@@ -111,13 +143,14 @@ _BASIS = [
     ("const",       lambda s, w: 1.0),
 ]
 
-# Clean single-term closed forms to test for an EXACT match first.
+# Fallback single-term closed forms (the primary model is the expected-value
+# form fit in _fit_expected_value; these rarely trigger). NOTE: the TRUE judge
+# formula is cost = w*ts + (1-w)*100*num_tasks — see _fit_expected_value.
 _EXACT_FORMS = [
     ("ts",            lambda s, w: s),
     ("ts*(1-w)",      lambda s, w: s * (1.0 - w)),
     ("ts/w",          lambda s, w: s / w if w else None),
     ("ts*(1-w)/w",    lambda s, w: s * (1.0 - w) / w if w else None),
-    ("ts+90*(1-w)",   lambda s, w: s + 90.0 * (1.0 - w)),  # discovered form
     ("ts*w",          lambda s, w: s * w),
 ]
 
@@ -132,7 +165,13 @@ class CostModel:
         self.calibrated = calibrated
         self.n_points = n_points
 
-    def predict_cost(self, total_score, willingness):
+    def predict_cost(self, total_score, willingness, num_tasks=1):
+        if self.form == "expected_value":
+            # cost = w*ts + (1-w)*P*num_tasks  (exact judge formula; convex
+            # combination, so it never extrapolates to negative/garbage values).
+            P = self.params["P"]
+            return (willingness * total_score
+                    + (1.0 - willingness) * P * num_tasks)
         if self.form.startswith("exact:"):
             name = self.form.split(":", 1)[1]
             fn = dict(_EXACT_FORMS)[name]
@@ -182,16 +221,44 @@ def _solve_normal_equations(A, b, ridge=1e-9):
     return [M[i][n] for i in range(n)]
 
 
+def _fit_expected_value(points):
+    """Fit cost = w*ts + (1-w)*P*num_tasks for the single parameter P (the
+    per-task failure penalty). Least squares:
+        P = Σ (1-w)*nt*(cost - w*ts) / Σ ((1-w)*nt)^2
+    Robust by construction: a convex combination that never extrapolates to
+    negative/garbage values for valid (ts, w∈[0,1], nt≥1)."""
+    num = den = 0.0
+    for ts, w, nt, cost in points:
+        base = (1.0 - w) * nt
+        num += base * (cost - w * ts)
+        den += base * base
+    if den <= 0:
+        return None
+    P = num / den
+    model = CostModel("expected_value", {"P": P}, n_points=len(points))
+    max_err = max(abs(model.predict_cost(ts, w, nt) - cost)
+                  for ts, w, nt, cost in points)
+    model.max_resid = max_err
+    return model
+
+
 def fit_cost_model(points):
-    """Try exact closed forms first; fall back to linear least-squares."""
+    """Fit the exact expected-value form first; fall back to closed forms /
+    linear least-squares only if it does not match."""
     if not points:
         return None
 
-    # 1) exact single-term forms
+    # 1) PRIMARY: exact expected-value form cost = w*ts + (1-w)*P*num_tasks
+    ev = _fit_expected_value(points)
+    if ev is not None and ev.max_resid <= COST_TOL * 100:  # ≤0.1 abs error
+        ev.calibrated = True
+        return ev
+
+    # 2) exact single-term forms (no num_tasks dependence)
     for name, fn in _EXACT_FORMS:
         ok = True
         max_err = 0.0
-        for s, w, cost in points:
+        for s, w, nt, cost in points:
             pred = fn(s, w)
             if pred is None:
                 ok = False
@@ -204,20 +271,26 @@ def fit_cost_model(points):
             return CostModel(f"exact:{name}", {}, max_resid=max_err,
                              calibrated=True, n_points=len(points))
 
-    # 2) linear least-squares over the basis
+    # 3) last resort: linear least-squares over the basis (NOT robust to
+    #    extrapolation — only used if the exact forms somehow fail)
     basis = _BASIS
-    A = [[fn(s, w) for _, fn in basis] for s, w, _ in points]
-    b = [cost for _, _, cost in points]
+    A = [[fn(s, w) for _, fn in basis] for s, w, _, _ in points]
+    b = [cost for _, _, _, cost in points]
     coef = _solve_normal_equations(A, b)
     if coef is None:
-        return None
+        return ev  # return the expected-value fit even if slightly off
     params = {name: coef[i] for i, (name, _) in enumerate(basis)}
     max_err = max(
         abs(sum(coef[i] * fn(s, w) for i, (_, fn) in enumerate(basis)) - cost)
-        for s, w, cost in points)
-    return CostModel("linear", params, max_resid=max_err,
-                     calibrated=(max_err <= COST_TOL * 100),  # looser for regression
-                     n_points=len(points))
+        for s, w, _, cost in points)
+    linear = CostModel("linear", params, max_resid=max_err,
+                       calibrated=(max_err <= COST_TOL * 100),
+                       n_points=len(points))
+    # Prefer whichever fits better.
+    if ev is not None and ev.max_resid <= max_err:
+        ev.calibrated = ev.max_resid <= COST_TOL * 100
+        return ev
+    return linear
 
 
 def fit_penalty(aggregates):
@@ -238,28 +311,50 @@ def fit_penalty(aggregates):
 
 
 def validate(model, aggregates, points):
-    """Compare predicted vs actual. Returns a report dict."""
-    # per-assignment residual (cost points)
-    cost_max_err = max((abs(model.predict_cost(s, w) - cost)
-                        for s, w, cost in points), default=0.0)
-    # per-case predicted vs reported
+    """Compare predicted vs actual. Returns a report dict.
+
+    Per-case validation is GENUINE only for cases with a local input file
+    (model_feats present): there we recompute each assignment's cost from input
+    features via the model and rebuild the case score — so the error reflects
+    real model accuracy. For cases without local input we can only sum the
+    judge's own costs (an identity → ~0), flagged genuine=False.
+    """
+    # per-assignment residual (cost points) — always a genuine model test
+    cost_max_err = max((abs(model.predict_cost(s, w, nt) - cost)
+                        for s, w, nt, cost in points), default=0.0)
+
     case_rows = []
-    case_max_err = 0.0
+    genuine_max_err = 0.0          # max err over genuine (model-based) cases
+    agg_max_err = 0.0             # max err over aggregation-only cases
+    have_genuine = False
     for a in aggregates:
         rep, sc, u = a.get("reported"), a.get("sum_cost"), a.get("unassigned") or 0
         if rep is None:
             continue
-        predicted = sc + model.penalty_per_task * u
+        feats = a.get("model_feats")
+        if feats is not None:
+            predicted = sum(model.predict_cost(ts, w, nt) for ts, w, nt in feats) \
+                + model.penalty_per_task * u
+            genuine = True
+            have_genuine = True
+        else:
+            predicted = sc + model.penalty_per_task * u   # tautological identity
+            genuine = False
         err = abs(predicted - rep)
-        case_max_err = max(case_max_err, err)
+        if genuine:
+            genuine_max_err = max(genuine_max_err, err)
+        else:
+            agg_max_err = max(agg_max_err, err)
         case_rows.append({"case": a["case"], "reported": rep,
                           "predicted": predicted, "err": err,
-                          "unassigned": u})
-    calibrated = (cost_max_err <= COST_TOL and case_max_err <= CASE_TOL) or \
-                 (model.form == "linear" and case_max_err <= CASE_TOL)
+                          "unassigned": u, "genuine": genuine})
+
+    # The headline per-case error is the GENUINE one when available.
+    case_max_err = genuine_max_err if have_genuine else agg_max_err
+    calibrated = cost_max_err <= COST_TOL * 100 and case_max_err <= CASE_TOL
     return {"cost_max_err": cost_max_err, "case_max_err": case_max_err,
             "calibrated": calibrated, "cases": case_rows,
-            "n_points": len(points)}
+            "n_points": len(points), "have_genuine": have_genuine}
 
 
 # ---------------------------------------------------------------------------
@@ -277,9 +372,15 @@ def load_model():
         return CostModel.from_dict(json.load(f))
 
 
-def recalibrate(records=None, verbose=True):
-    """Mine logged detail, fit cost() + penalty, validate, persist. Returns report."""
-    points, aggregates = build_dataset(records)
+def recalibrate(records=None, verbose=True, only_best=True, max_cost=float("inf")):
+    """Mine logged detail, fit cost() + penalty, validate, persist. Returns report.
+
+    only_best: only use the best-scoring submission for calibration (default True
+               to avoid distortion from old bad solvers).
+    max_cost: optional cost upper bound (default off — the exact formula fits all
+              points, so no outlier filtering is needed).
+    """
+    points, aggregates = build_dataset(records, only_best=only_best, max_cost=max_cost)
     if not aggregates:
         if verbose:
             print("  [calibrate] no submission detail in log yet — run a probe first.")
@@ -308,13 +409,21 @@ def _print_report(model, report):
     print(f"  [calibrate] cost form: {model.form}  "
           f"penalty/task={model.penalty_per_task:.4f}  "
           f"points={report['n_points']}")
+    kind = "model-based" if report.get("have_genuine") else "aggregation-only"
     print(f"  [calibrate] per-assignment max err={report['cost_max_err']:.4g}  "
-          f"per-case max err={report['case_max_err']:.4g}  "
+          f"per-case max err={report['case_max_err']:.4g} ({kind})  "
           f"=> calibrated={report['calibrated']}")
+    print(f"  [calibrate] per-case is a genuine model test only for cases with a "
+          f"local input file; others are tagged (agg-only).")
     for row in sorted(report["cases"], key=lambda r: r["err"], reverse=True)[:10]:
-        flag = "" if row["err"] <= CASE_TOL else "  <-- MISMATCH"
+        if not row.get("genuine"):
+            tag = "  (agg-only, tautological)"
+        elif row["err"] > CASE_TOL:
+            tag = "  <-- MISMATCH"
+        else:
+            tag = ""
         print(f"      {row['case']}: predicted={row['predicted']:.2f} "
-              f"actual={row['reported']:.2f} err={row['err']:.3g}{flag}")
+              f"actual={row['reported']:.2f} err={row['err']:.3g}{tag}")
 
 
 if __name__ == "__main__":

@@ -167,7 +167,6 @@ def build_knowledge_digest(records: list) -> str:
     lines.append("\nKEY LESSONS:")
     lines.append("  - Output each chosen row's task_id_list string VERBATIM "
                  "(no re-sorting) or the case is scored INVALID.")
-    lines.append("  - Per-case score = sum of per-assignment cost + penalty for "
-                 "unassigned tasks; covering more tasks AND picking low-cost "
-                 "(high-willingness) assignments both help.")
+    lines.append("  - The judge's cost per assignment is NOT raw total_score. "
+                 "Optimize for the calibrated cost model provided in the prompt.")
     return "\n".join(lines)
