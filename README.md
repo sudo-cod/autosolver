@@ -1,108 +1,167 @@
 # AutoSolver Agent
 
-An **agentic system** for the food-delivery task-assignment problem. It does not
-just solve the problem once — it *writes solver code, gets it scored, reflects on
-the score, and rewrites the code to drive the score down*, looping autonomously.
+An **agentic system** for the food-delivery courier task-assignment problem ([hackathon.mykeeta.com](https://hackathon.mykeeta.com)). The agent **writes Python solver code**, runs it through a local gate and/or the real judge, **reflects on the result**, and rewrites the code in a loop to drive the score down.
 
 ```
-   ┌──────────── Claude API (the "brain") ────────────┐
-   │  writes / revises a solve() function              │
-   └───────────────────────┬───────────────────────────┘
-                           │ solver code
-                           ▼
-                  run in sandbox + SUBMIT
-                           │
-                           ▼ score (lower = better)
-                  ┌──────── judge ────────┐
-                  │ real judge OR local   │
-                  └───────────┬───────────┘
-                              │ score + notes
-                              ▼
-                  REFLECT: "why this score? what to change?"
-                              │
-                              └──────────► next revision (loop)
+  ┌──────────── LLM (Longcat / DeepSeek) ────────────┐
+  │  writes / revises solve(input_text) -> list       │
+  └───────────────────────┬───────────────────────────┘
+                          │ solver code
+                          ▼
+                 run_local_gate (validate + score)
+                          │
+            ┌─────────────┴─────────────┐
+            ▼                           ▼
+     local test suite              real judge
+     (offline dev)                 (20 submits/day)
+            │                           │
+            └──────── score (lower = better) ────────┘
+                          │
+                          ▼
+              reflect → archive → next iteration
 ```
 
-## Files
+## Problem
 
-| file | role |
-|---|---|
-| `agent.py` | the loop: generate → submit → score → reflect → rewrite |
-| `judge_adapter.py` | **the only file you customize** — how a score is obtained |
-| `best_solver.py` | (output) best-scoring solver found so far |
-| `run_log.jsonl` | (output) every iteration: code hash, score, notes |
+**Input:** tab-separated candidate assignments (`task_id_list`, `courier_id`, `total_score`, `willingness`).
 
-## Quick start (offline, no judge needed)
+**Output:** a list of `(task_str, [courier, ...])` tuples. The courier list may include a primary and backup couriers for the same task.
 
-Develop and watch the loop work using the **local scorer** first:
+**Objective (lexicographic):**
+1. Maximize the number of covered tasks.
+2. Among equal coverage, minimize cost (the judge's formula is calibrated from real submissions).
+
+Key levers: 2-task bundles (one courier, two tasks), backup couriers to reduce risk, penalty of 100 per uncovered task.
+
+## Requirements
+
+- Python 3.10+
+- Stdlib only for the agent loop (optional: `playwright` for browser mode; `pulp`/`ortools` inside generated solvers)
+- API key in `.env`:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-...
+LONGCAT_KEY=...          # default provider
+# DEEPSEEK_KEY=...       # alternative: --provider deepseek
+```
+
+## Quick start (offline)
+
+Generate the synthetic suite (10 case archetypes) and run the agent locally:
+
+```bash
+python3 make_synthetic.py
 export JUDGE_MODE=local
-export LOCAL_CASE=/path/to/large_seed301.txt
-python3 agent.py --iterations 12 --model claude-opus-4-8
+python3 agent.py --iterations 12 --mode react
 ```
 
-The local scorer mirrors the stated objective (maximize covered orders, then
-minimize total score). Use it to confirm the agent improves across iterations
-before spending submissions on the real judge.
+The local gate runs the solver on every `.txt` in `dataset/` (real `large_seed301.txt` plus synthetic `syn_*.txt`), validates the output, and scores via `cost_model.json` when calibrated.
 
-## Wiring the real judge (hackathon.mykeeta.com)
+## Real judge (HTTP)
 
-You weren't sure how the site takes submissions. Open it, submit once by hand
-with browser devtools open, and check the **Network** tab. Then pick a mode:
+`http` mode is already implemented in `judge_adapter.py` — login → POST `/judge` → poll `/result/{job_id}`.
 
-**If there's an HTTP API** (you see a POST request when you submit):
 ```bash
-export JUDGE_MODE=http
-export JUDGE_URL="<the POST url you saw>"
-export JUDGE_TOKEN="<bearer/cookie if required>"
-```
-Then in `judge_adapter._submit_http`, adjust the request field names
-(`code`/`case`/`language`) and the response parsing (`data["score"]`) to match
-what you actually saw in devtools.
+# .env
+JUDGE_MODE=http
+JUDGE_TEAM=your_team
+JUDGE_EMAIL=your@email.com
+# JUDGE_BASE=https://hackathon.mykeeta.com   # default
 
-**If it's a web form** (paste code, click submit, score appears on the page):
+python3 agent.py --mode submit --max-submits 6
+```
+
+On the first run in `http` mode, the agent automatically spends 1 submission to calibrate the cost formula (`--calibrate`).
+
+Other judge modes (see `judge_adapter.py`):
+
+| `JUDGE_MODE` | Description |
+|---|---|
+| `local` | Offline scoring on local cases (default) |
+| `http` | hackathon.mykeeta.com API |
+| `browser` | Headless Playwright (CSS selectors required) |
+| `manual` | Agent writes `current_solver.py`; you type the score back |
+
+## Agent modes
+
 ```bash
-pip install playwright && playwright install chromium
-export JUDGE_MODE=browser
-export JUDGE_URL="https://hackathon.mykeeta.com/..."
-export SEL_CODE="<css selector for the code textarea>"
-export SEL_SUBMIT="<css selector for the submit button>"
-export SEL_SCORE="<css selector for the score element>"
-# if login is needed, save cookies once and point JUDGE_STORAGE at them
+python3 agent.py --mode react      # LLM controller picks actions (default)
+python3 agent.py --mode linear     # fixed generate → score → reflect loop
+python3 agent.py --mode submit     # deliberate real submits with daily budget
 ```
 
-**If neither can be automated:**
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--iterations N` | Number of steps (react/linear) |
+| `--candidates N` | Best-of-N candidates per iteration |
+| `--provider longcat\|deepseek` | LLM provider |
+| `--model NAME` | Model name (default: `LongCat-2.0-Preview` / `deepseek-chat`) |
+| `--max-submits N` | Cap on real submits in `submit` mode |
+| `--calibrate` | 1 judge probe → `cost_model.json`, then exit |
+| `--consolidate` | Distill history into `memory_brief.md`, then exit |
+
+Judge daily limit: **20 submissions per team** (resets at Beijing midnight). The agent tracks the remaining budget in `agent_state.json` and adjusts probe aggressiveness accordingly.
+
+## Project layout
+
+| File | Role |
+|---|---|
+| `agent.py` | Main loop: generate → gate → submit → reflect |
+| `judge_adapter.py` | **The only file to customize for your judge** — `submit_and_score()`, local gate |
+| `archive.py` | Cross-run memory: `run_log.jsonl`, `solver_archive/` |
+| `calibrate.py` | Reverse-engineer cost formula from judge responses → `cost_model.json` |
+| `reconcile.py` | Suite→real mapping (`real ≈ a·pred + b`) → `recon.json` |
+| `memory.py` | Consolidate history into a tight `memory_brief.md` |
+| `make_synthetic.py` | Generate `dataset/syn_*.txt` (10 archetypes) |
+| `calibrate_synthetic.py` | Tune synthetic cases to match real per-case scores |
+| `dashboard.py` | Build static `dashboard.html` from logs |
+| `watch.py` | Live terminal panel (run in a second terminal) |
+| `submit_bet.py` | Manually submit ready-made solvers to the judge |
+| `best_solver.py` | Best solver found so far (generated) |
+| `standalone_solver.py` | Hand-written ILP/greedy solver (not the agent) |
+| `dataset/` | Local cases (`large_seed301.txt`, `syn_*.txt`) |
+| `Docs/AutoSolver系统设计方案_团优解.pdf` | AutoSolver 系统设计方案 |
+| `Docs/介绍视频_团优解.movf` | 产品介绍与展示 |
+
+
+### Generated artifacts (in `.gitignore`)
+
+`run_log.jsonl`, `calls.jsonl`, `agent_state.json`, `cost_model.json`, `recon.json`, `solver_archive/`, `dashboard.html`, `memory_brief.md`
+
+## Monitoring
+
 ```bash
-export JUDGE_MODE=manual
+# Terminal 1
+python3 agent.py --mode submit
+
+# Terminal 2 — live status
+python3 watch.py
+
+# After a run — HTML dashboard
+python3 dashboard.py && open dashboard.html
 ```
-The agent writes the current solver to `current_solver.py`, pauses, you submit
-it on the site, and type the score back. Slower, but fully functional.
 
-## IMPORTANT — score direction
+## Calibration and local scoring accuracy
 
-The agent always **minimizes**. If the judge reports a score where *higher is
-better*, negate it inside the adapter (`score = -raw_score`) so the loop
-optimizes the right direction.
+1. **`calibrate.py`** — mines `case_results[].detail` from real judge responses to learn `cost(total_score, willingness)` and the uncovered-task penalty.
+2. **`reconcile.py`** — fits a linear correction from (local pred, real avg) pairs so the `submit`-mode gate filters candidates in real units.
+3. **`calibrate_synthetic.py`** — tunes willingness in synthetic cases to match the champion's real per-case scores.
 
-## Calibrating the objective
-
-The competition prompt is internally ambiguous (can one task go to multiple
-couriers? does `willingness` enter the score?). Two-step approach:
-
-1. Run a few iterations against the **real judge** with deliberately different
-   solvers (max coverage; min score; with/without bundling).
-2. Compare the judge's scores to what the local scorer predicted. Where they
-   diverge, fix `_score_solution_locally` in `judge_adapter.py` and update
-   `PROBLEM_BRIEF`/`OBJECTIVE` so the agent optimizes the *real* metric.
+Without calibration, the local suite is only an approximation. After one or more real submits, the agent uses the calibrated model for go/no-go decisions.
 
 ## Notes
 
-- Solver code from the LLM runs in a subprocess with a hard timeout, so a buggy
-  or slow solver can't hang the loop.
-- Invalid solutions (reused courier/task, unknown pair) are rejected before
-  scoring and fed back as a failure for the LLM to fix.
-- Context is trimmed each iteration to keep token usage bounded over long runs.
-- `claude-opus-4-8` is the strongest brain; `claude-sonnet-4-6` is cheaper/faster
-  for more iterations per dollar.
+- The agent **always minimizes** score. If the judge reports higher-is-better, negate it inside `judge_adapter.py`.
+- Solver code runs in a subprocess with a hard timeout; invalid solutions are rejected before scoring.
+- LLM context is trimmed each iteration; long-term memory lives in `archive` + `memory_brief.md`.
+- Synthetic cases use the `syn_` prefix so their names never collide with real judge case names.
+
+## Example `.env`
+
+```bash
+LONGCAT_KEY=sk-...
+JUDGE_MODE=http
+JUDGE_TEAM=MyTeam
+JUDGE_EMAIL=me@example.com
+```

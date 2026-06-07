@@ -64,9 +64,12 @@ def parse_algorithm(code: str) -> str:
 
 
 def _submitted_ok(records: list) -> list:
-    """Records that were really submitted and scored by the judge."""
+    """Records that were really submitted and scored by the judge — EXCLUDING
+    manual/human-injected solvers (`manual: true`), so the agent's champion,
+    seed, and knowledge reflect only what the AGENT itself produced."""
     return [r for r in records
-            if r.get("submitted") and r.get("ok") and r.get("score") is not None]
+            if r.get("submitted") and r.get("ok")
+            and r.get("score") is not None and not r.get("manual")]
 
 
 def per_case_analysis(records: list) -> list:
@@ -108,6 +111,8 @@ def _approaches_tried(records: list) -> list:
     Returns list of (algorithm, best_real_score_or_None, outcome) sorted by score."""
     agg = {}  # algorithm -> {"score": min real score or None, "valid_local": bool, "invalid": bool}
     for r in records:
+        if r.get("manual"):           # don't surface human-injected solvers
+            continue
         algo = r.get("algorithm") or "unlabeled"
         a = agg.setdefault(algo, {"score": None, "valid_local": False, "invalid": False})
         if r.get("submitted") and r.get("ok") and r.get("score") is not None:
@@ -129,11 +134,40 @@ def _approaches_tried(records: list) -> list:
     return out
 
 
+def _load_brief():
+    """The consolidated strategy brief (memory_brief.md), if present."""
+    path = os.path.join(HERE, "memory_brief.md")
+    if os.path.exists(path):
+        try:
+            return open(path).read().strip()
+        except Exception:
+            return None
+    return None
+
+
 def build_knowledge_digest(records: list) -> str:
     """Formatted accumulated-knowledge block for the agent's opening prompt.
+    Prefers the LLM-distilled strategy brief (memory_brief.md) + the live per-case
+    weak-spot table; falls back to the flat list when no brief exists.
     Empty string when there is no usable history yet."""
     if not records:
         return ""
+
+    brief = _load_brief()
+    if brief:
+        # Distilled brief + the current weak-spot table (always fresh from data).
+        out = ["\n\n=== STRATEGY MEMORY (distilled) ===", brief]
+        cases = per_case_analysis(records)
+        if cases:
+            out.append("\nCurrent per-case best (WEAK first — attack these):")
+            for row in cases:
+                a, t = row["assigned"], row["total"]
+                flag = (f"  <-- {t-a} UNCOVERED" if a is not None and t is not None
+                        and a < t else "")
+                out.append(f"  {row['case']}: {row['best_score']:.1f} "
+                           f"assigned={a}/{t}{flag}")
+        out.append("\n  - Output each row's task_id_list VERBATIM or it is INVALID.")
+        return "\n".join(out)
 
     lines = ["\n\n=== ACCUMULATED KNOWLEDGE "
              f"(from {len(records)} past attempts) ==="]
@@ -167,7 +201,6 @@ def build_knowledge_digest(records: list) -> str:
     lines.append("\nKEY LESSONS:")
     lines.append("  - Output each chosen row's task_id_list string VERBATIM "
                  "(no re-sorting) or the case is scored INVALID.")
-    lines.append("  - Per-case score = sum of per-assignment cost + penalty for "
-                 "unassigned tasks; covering more tasks AND picking low-cost "
-                 "(high-willingness) assignments both help.")
+    lines.append("  - The judge's cost per assignment is NOT raw total_score. "
+                 "Optimize for the calibrated cost model provided in the prompt.")
     return "\n".join(lines)
