@@ -1,6 +1,7 @@
 # AutoSolver Agent
 
 DEMO 视频： https://www.bilibili.com/video/BV16EEh6KEWh/?spm_id_from=333.1387.homepage.video_card.click&vd_source=90744a174c9137c1d226dab5a09f657b
+设计方案：AutoSolver系统设计方案_团优解.pdf
 
 An **agentic system** for the food-delivery courier task-assignment problem ([hackathon.mykeeta.com](https://hackathon.mykeeta.com)). The agent **writes Python solver code**, runs it through a local gate and/or the real judge, **reflects on the result**, and rewrites the code in a loop to drive the score down.
 
