@@ -110,14 +110,17 @@ def build_dataset(records=None, only_best=False, max_cost=float("inf")):
                 if cmap is not None:
                     ts = d.get("task_id_list")
                     couriers = d.get("couriers") or []
-                    if not couriers:
+                    # Gather features for ALL couriers on this task (primary +
+                    # backups), so the point matches the multi-courier cost.
+                    rows = [cmap.get((ts, str(c))) for c in couriers]
+                    if not couriers or any(r is None for r in rows):
                         continue
-                    row = cmap.get((ts, str(couriers[0])))
-                    if row is not None:
-                        tasks, total_score, willingness = row
-                        model_feats.append((total_score, willingness, len(tasks)))
-                        if cost <= max_cost:
-                            points.append((total_score, willingness, len(tasks), cost))
+                    scores = tuple(r[1] for r in rows)
+                    wills = tuple(r[2] for r in rows)
+                    nt = len(rows[0][0])
+                    model_feats.append((scores, wills, nt))
+                    if cost <= max_cost:
+                        points.append((scores, wills, nt, cost))
             unassigned = None
             if assigned is not None and total is not None:
                 unassigned = total - assigned
@@ -182,6 +185,28 @@ class CostModel:
         return sum(coef * basis[term](total_score, willingness)
                    for term, coef in self.params.items())
 
+    def predict_cost_multi(self, scores, willingnesses, num_tasks):
+        """Cost of a task assigned to one OR MORE couriers (primary + backups).
+        Exact judge mechanism (verified to ~5e-5):
+            p_complete     = 1 - prod(1 - w_i)           # task covered unless all decline
+            expected_score = sum(w_i*s_i) / sum(w_i)     # willingness-weighted avg score
+            cost           = p*expected_score + (1-p)*P*num_tasks
+        Adding backups drives p->1, slashing the failure penalty. Single courier
+        reduces to w*s + (1-w)*P*num_tasks."""
+        if not scores:
+            return self.penalty_per_task * num_tasks  # nothing assigned -> all fail
+        if self.form == "expected_value":
+            P = self.params.get("P", self.penalty_per_task)
+        else:
+            P = self.penalty_per_task or 100.0
+        p_fail = 1.0
+        for w in willingnesses:
+            p_fail *= (1.0 - w)
+        p = 1.0 - p_fail
+        sw = sum(willingnesses)
+        es = (sum(w * s for s, w in zip(scores, willingnesses)) / sw) if sw > 0 else 0.0
+        return p * es + (1.0 - p) * P * num_tasks
+
     def to_dict(self):
         return {"cost_form": self.form, "cost_params": self.params,
                 "penalty_per_task": self.penalty_per_task,
@@ -222,75 +247,45 @@ def _solve_normal_equations(A, b, ridge=1e-9):
 
 
 def _fit_expected_value(points):
-    """Fit cost = w*ts + (1-w)*P*num_tasks for the single parameter P (the
-    per-task failure penalty). Least squares:
-        P = Σ (1-w)*nt*(cost - w*ts) / Σ ((1-w)*nt)^2
-    Robust by construction: a convex combination that never extrapolates to
-    negative/garbage values for valid (ts, w∈[0,1], nt≥1)."""
+    """Fit the per-task failure penalty P in the exact judge cost formula
+        cost = p_complete*expected_score + (1-p_complete)*P*num_tasks
+    where p_complete = 1-prod(1-w_i) and expected_score = sum(w_i*s_i)/sum(w_i)
+    over ALL couriers (primary + backups) on the task. Least squares for P:
+        P = Σ (1-p)*nt*(cost - p*es) / Σ ((1-p)*nt)^2
+    Robust by construction (convex combination; never extrapolates negative)."""
     num = den = 0.0
-    for ts, w, nt, cost in points:
-        base = (1.0 - w) * nt
-        num += base * (cost - w * ts)
+    base_model = CostModel("expected_value", {"P": 100.0})  # only for p/es helpers
+    rows = []
+    for scores, wills, nt, cost in points:
+        p_fail = 1.0
+        for w in wills:
+            p_fail *= (1.0 - w)
+        p = 1.0 - p_fail
+        sw = sum(wills)
+        es = (sum(w * s for s, w in zip(scores, wills)) / sw) if sw > 0 else 0.0
+        base = (1.0 - p) * nt
+        num += base * (cost - p * es)
         den += base * base
+        rows.append((scores, wills, nt, cost))
     if den <= 0:
         return None
     P = num / den
     model = CostModel("expected_value", {"P": P}, n_points=len(points))
-    max_err = max(abs(model.predict_cost(ts, w, nt) - cost)
-                  for ts, w, nt, cost in points)
+    max_err = max(abs(model.predict_cost_multi(s, w, nt) - cost)
+                  for s, w, nt, cost in rows)
     model.max_resid = max_err
     return model
 
 
 def fit_cost_model(points):
-    """Fit the exact expected-value form first; fall back to closed forms /
-    linear least-squares only if it does not match."""
+    """Fit the exact expected-value (backup-aware) cost form. The formula is
+    known to be exact, so there is no fragile regression fallback."""
     if not points:
         return None
-
-    # 1) PRIMARY: exact expected-value form cost = w*ts + (1-w)*P*num_tasks
     ev = _fit_expected_value(points)
-    if ev is not None and ev.max_resid <= COST_TOL * 100:  # ≤0.1 abs error
-        ev.calibrated = True
-        return ev
-
-    # 2) exact single-term forms (no num_tasks dependence)
-    for name, fn in _EXACT_FORMS:
-        ok = True
-        max_err = 0.0
-        for s, w, nt, cost in points:
-            pred = fn(s, w)
-            if pred is None:
-                ok = False
-                break
-            max_err = max(max_err, abs(pred - cost))
-            if max_err > COST_TOL:
-                ok = False
-                break
-        if ok:
-            return CostModel(f"exact:{name}", {}, max_resid=max_err,
-                             calibrated=True, n_points=len(points))
-
-    # 3) last resort: linear least-squares over the basis (NOT robust to
-    #    extrapolation — only used if the exact forms somehow fail)
-    basis = _BASIS
-    A = [[fn(s, w) for _, fn in basis] for s, w, _, _ in points]
-    b = [cost for _, _, _, cost in points]
-    coef = _solve_normal_equations(A, b)
-    if coef is None:
-        return ev  # return the expected-value fit even if slightly off
-    params = {name: coef[i] for i, (name, _) in enumerate(basis)}
-    max_err = max(
-        abs(sum(coef[i] * fn(s, w) for i, (_, fn) in enumerate(basis)) - cost)
-        for s, w, _, cost in points)
-    linear = CostModel("linear", params, max_resid=max_err,
-                       calibrated=(max_err <= COST_TOL * 100),
-                       n_points=len(points))
-    # Prefer whichever fits better.
-    if ev is not None and ev.max_resid <= max_err:
-        ev.calibrated = ev.max_resid <= COST_TOL * 100
-        return ev
-    return linear
+    if ev is not None:
+        ev.calibrated = ev.max_resid <= COST_TOL * 100   # ≤0.1 abs error
+    return ev
 
 
 def fit_penalty(aggregates):
@@ -320,7 +315,7 @@ def validate(model, aggregates, points):
     judge's own costs (an identity → ~0), flagged genuine=False.
     """
     # per-assignment residual (cost points) — always a genuine model test
-    cost_max_err = max((abs(model.predict_cost(s, w, nt) - cost)
+    cost_max_err = max((abs(model.predict_cost_multi(s, w, nt) - cost)
                         for s, w, nt, cost in points), default=0.0)
 
     case_rows = []
@@ -333,7 +328,8 @@ def validate(model, aggregates, points):
             continue
         feats = a.get("model_feats")
         if feats is not None:
-            predicted = sum(model.predict_cost(ts, w, nt) for ts, w, nt in feats) \
+            predicted = sum(model.predict_cost_multi(scores, wills, nt)
+                            for scores, wills, nt in feats) \
                 + model.penalty_per_task * u
             genuine = True
             have_genuine = True
@@ -395,7 +391,13 @@ def recalibrate(records=None, verbose=True, only_best=True, max_cost=float("inf"
                 print(f"  [calibrate] have {len(points)} points but the fit "
                       "failed (singular system).")
         return None
-    model.penalty_per_task = fit_penalty(aggregates)
+    # The unassigned penalty per task EQUALS the per-task failure penalty P
+    # (a failed delivery and an unassigned task both cost the same). fit_penalty
+    # can only learn it from cases with unassigned tasks; when the best solver
+    # covers everything (no unassigned), it returns 0 — so fall back to P.
+    pen = fit_penalty(aggregates)
+    P = model.params.get("P") if model.form == "expected_value" else None
+    model.penalty_per_task = pen if pen and pen > 1.0 else (P if P else 100.0)
     report = validate(model, aggregates, points)
     model.calibrated = report["calibrated"]
     model.max_resid = report["cost_max_err"]

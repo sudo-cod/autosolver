@@ -8,3 +8,11 @@ cost_model.json
 solver_archive/
 .venv/
 .idea/
+dataset/syn_*.txt
+probe_backup.py
+recon.json
+recon_cache.json
+calls.jsonl
+calib_log.jsonl
+dashboard.html
+memory_brief.md

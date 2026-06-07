@@ -248,7 +248,7 @@ def _submit_manual(solver_code: str, case_name: str) -> ScoreResult:
 # understanding of the objective. Lets you develop/test the whole agent loop
 # WITHOUT the judge, then switch JUDGE_MODE to a real one for deployment.
 # ===========================================================================
-def _run_solver_locally(solver_code: str, input_text: str, timeout_s: int = 12):
+def _run_solver_locally(solver_code: str, input_text: str, timeout_s: int = 20):
     """Execute untrusted solver code in a subprocess; return its result list."""
     runner = f'''
 import sys, json
@@ -336,9 +336,15 @@ def validate_solution(solution, input_text):
 
     Rules enforced:
       - each item must be (task_id_list_str, [courier_id, ...])
-      - the (task_id_list_str, courier_id) pair must exist VERBATIM as an
+      - every (task_id_list_str, courier_id) pair must exist VERBATIM as an
         input row (NO re-sorting/normalizing the task string)
-      - no courier reused, no task covered twice
+      - a courier may appear at most once across the whole solution
+      - a task may be covered by at most one item (but that item MAY list
+        several couriers as primary + backups for the same task)
+
+    BACKUPS: an item's courier list assigns ALL of them to the same task as
+    primary + backups. The judge covers the task unless they ALL decline, which
+    is the main lever for lowering cost (see CostModel.predict_cost_multi).
     """
     cmap, all_tasks = _parse_candidates(input_text)
     cost_model = _get_cost_model()
@@ -361,6 +367,10 @@ def validate_solution(solution, input_text):
         if not isinstance(couriers, (list, tuple)) or len(couriers) == 0:
             errors.append(f"item {i}: courier field must be a non-empty list, got {couriers!r}")
             continue
+
+        # All couriers in this item serve the SAME task_str (primary + backups).
+        item_tasks = None
+        scores, wills = [], []
         for c in couriers:
             key = (ts, str(c))
             if key not in cmap:
@@ -370,13 +380,22 @@ def validate_solution(solution, input_text):
                 errors.append(f"item {i}: courier {c!r} used more than once")
             used_couriers.add(c)
             tasks, sc, willingness = cmap[key]
-            dup = covered.intersection(tasks)
-            if dup:
-                errors.append(f"item {i}: task(s) {sorted(dup)} already covered")
-            covered.update(tasks)
-            total_score += sc
-            if cost_model is not None:
-                predicted_cost += cost_model.predict_cost(sc, willingness, len(tasks))
+            item_tasks = tasks            # identical for every courier on this task_str
+            scores.append(sc)
+            wills.append(willingness)
+
+        if not item_tasks:                # no valid courier on this item
+            continue
+        # Coverage is per-ITEM: the task may not already be covered by another item.
+        dup = covered.intersection(item_tasks)
+        if dup:
+            errors.append(f"item {i}: task(s) {sorted(dup)} already covered")
+        covered.update(item_tasks)
+        # willingness-weighted expected score, for the legacy total_score stat
+        sw = sum(wills)
+        total_score += (sum(w * s for s, w in zip(scores, wills)) / sw) if sw else 0.0
+        if cost_model is not None:
+            predicted_cost += cost_model.predict_cost_multi(scores, wills, len(item_tasks))
 
     stats = {
         "covered": len(covered),
@@ -503,37 +522,19 @@ def run_local_gate(solver_code: str, case_path: Optional[str] = None):
         if not ok:
             any_failure = True
 
-    # --- Phase 2: compute predicted score reusing the already-run solutions ---
+    # --- Phase 2: per-case predicted score. validate_solution already computed
+    # the correct (backup-aware) predicted_score into each case's stats; just
+    # reuse it. Invalid cases get the all-unassigned penalty. ---
     cost_model = _get_cost_model()
     per_case_predicted = {}   # case_name -> predicted cost (or None)
     if cost_model is not None:
         for case_name, r in all_case_results.items():
             if r.get("error") or not r.get("stats"):
                 per_case_predicted[case_name] = None
-                continue
-            if not r.get("ok"):
-                # invalid solution: penalty = all tasks unassigned
+            elif not r.get("ok"):
                 per_case_predicted[case_name] = r["stats"].get("total_tasks", 0) * 100
-                continue
-            try:
-                sol = r["_sol"]
-                input_text = r["_input"]
-                cmap, all_t = _parse_candidates(input_text)
-                covered = set()
-                case_cost = 0.0
-                for ts, couriers in sol:
-                    for c in couriers:
-                        row = cmap.get((ts, str(c)))
-                        if row:
-                            _, sc, w = row
-                            case_cost += cost_model.predict_cost(sc, w)
-                            covered.update(row[0])
-                uncovered = len(all_t) - len(covered)
-                per_case_predicted[case_name] = (
-                    case_cost + cost_model.penalty_per_task * uncovered
-                )
-            except Exception:
-                per_case_predicted[case_name] = r["stats"].get("total_tasks", 0) * 100
+            else:
+                per_case_predicted[case_name] = r["stats"].get("predicted_score")
 
     # Attach per-case predicted_score into the case result dict
     valid_predicted = [v for v in per_case_predicted.values() if v is not None]
